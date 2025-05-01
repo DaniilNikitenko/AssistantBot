@@ -14,6 +14,9 @@ from timezonefinder import (
 import ephem  # для астрономических вычислений (фаза луны, восход/закат)
 import pytz  # для работы с часовыми поясами
 
+from deep_translator import GoogleTranslator
+
+
 # Загрузка переменных окружения из .env
 load_dotenv()
 
@@ -21,6 +24,7 @@ load_dotenv()
 bot = telebot.TeleBot(os.getenv("TELEGRAM_BOT_TOKEN"))
 api = os.getenv("API")  # API-ключ для погоды
 api_convert = os.getenv("API_CONVERT")  # API-ключ для конвертации валют
+api_nasa = os.getenv("NASA_API")
 amount = 0  # Сумма для конвертации
 
 lat = 0  # Широта
@@ -38,19 +42,62 @@ def get_location(message):
         lat, lon = message.location.latitude, message.location.longitude
         bot.send_message(
             message.chat.id,
-            "Геолокация была загружена успешна.\n Теперь введите название вашего города",
+            "📍 Геолокация была загружена успешна.\n Теперь введите название вашего города",
         )
         bot.register_next_step_handler(message, get_city)
         print(lat, lon)
     else:
-        bot.send_message(message.chat.id, "Пожалуйста, отправьте свою геолокацию.")
+        bot.send_message(message.chat.id, "📍 Пожалуйста, отправьте свою геолокацию.")
         bot.register_next_step_handler(message, get_location)
 
 
 def get_city(message):
     global city
     city = message.text.strip().lower()
+    bot.send_message(message.chat.id, "Город успешно сохранён")
     help_menu(message)
+
+
+@bot.message_handler(commands=["settings"])
+def setting_menu(message):
+    markup_settings = types.InlineKeyboardMarkup(
+        row_width=2
+    )  # создаем кнопки в 2 столбца
+    btn_city_change = types.InlineKeyboardButton(
+        "Изменить город", callback_data="change_city"
+    )
+    btn_geo_change = types.InlineKeyboardButton(
+        "Изменить геолокацию", callback_data="change_geo"
+    )
+    markup_settings.add(btn_city_change, btn_geo_change)
+
+    bot.send_message(message.chat.id, "Настройки:", reply_markup=markup_settings)
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data in ["change_city", "change_geo"]
+)
+def handle_settings_change(call):
+    if call.data == "change_city":
+        bot.send_message(call.message.chat.id, "Введите новый город")
+        bot.register_next_step_handler(call.message, get_city)
+    elif call.data == "change_geo":
+        bot.send_message(
+            call.message.chat.id, "Пожалуйста, отправьте новую геолокацию."
+        )
+        bot.register_next_step_handler(call.message, update_location_only)
+
+
+def update_location_only(message):
+    global lat, lon
+    if message.location:
+        lat, lon = message.location.latitude, message.location.longitude
+        bot.send_message(message.chat.id, "📍 Геолокация обновлена.")
+    else:
+        bot.send_message(
+            message.chat.id, "❗ Пожалуйста, отправьте корректную геолокацию."
+        )
+        bot.register_next_step_handler(message, update_location_only)
 
 
 @bot.message_handler(commands=["help"])
@@ -65,7 +112,7 @@ def help_menu(message):
     # Приветствие пользователя и показ меню
     bot.send_message(
         message.chat.id,
-        f"{message.from_user.first_name}! 👋\nЧто тебя интересует?",
+        f"{message.from_user.first_name}! 👋\nЧто тебя интересует?\n Для открытие настроек введи /settings",
         reply_markup=markup,
     )
 
@@ -87,20 +134,31 @@ def handle_main_menu(call):
 
 # Получение геолокации пользователя и отображение астрономического меню
 def astro_menu(message):
-    markup_astro = types.InlineKeyboardMarkup(row_width=2)
+    markup_astro = types.InlineKeyboardMarkup(row_width=1)
     bth_moon_phase = types.InlineKeyboardButton(
-        "Узнать фазу луны", callback_data="phase_moon"
+        "🌑 Узнать фазу луны", callback_data="phase_moon"
     )
     bth_sunrise_time = types.InlineKeyboardButton(
-        "Время восхода и заката Солнца", callback_data="sunrise"
+        "🌝 🌛 Время восхода и заката Солнца", callback_data="sunrise"
+    )
+    bth_astra_picture = types.InlineKeyboardButton(
+        "🌄 Астрономическая картинка дня", callback_data="astra_picture"
+    )
+    bth_position_planet = types.InlineKeyboardButton(
+        "🌎 Какие планеты видно сегодня", callback_data="astra_position_planet"
     )
 
-    markup_astro.add(bth_moon_phase, bth_sunrise_time)
+    markup_astro.add(
+        bth_moon_phase, bth_sunrise_time, bth_astra_picture, bth_position_planet
+    )
     bot.send_message(message.chat.id, "Выберите действие: ", reply_markup=markup_astro)
 
 
 # Обработка выбора в астрономическом меню
-@bot.callback_query_handler(func=lambda call: call.data in ["phase_moon", "sunrise"])
+@bot.callback_query_handler(
+    func=lambda call: call.data
+    in ["phase_moon", "sunrise", "astra_picture", "astra_position_planet"]
+)
 def handle_astro_menu(call):
     bot.answer_callback_query(call.id)
     if call.data == "phase_moon":
@@ -113,6 +171,10 @@ def handle_astro_menu(call):
         bot.send_message(
             call.message.chat.id, f"🌅 Восход: {sunrise} | 🌇 Закат: {sunset}"
         )
+    elif call.data == "astra_picture":
+        send_apod(call.message)
+    elif call.data == "astra_position_planet":
+        bot.send_message(call.message.chat.id, get_visible_planets(lat, lon))
 
 
 # Функции (не используются напрямую, возможно остались отладки)
@@ -175,6 +237,70 @@ def calculate_sun_times(lat, lon):
     sunset_local = sunset_utc.astimezone(local_tz)
 
     return sunrise_local.strftime("%H:%M"), sunset_local.strftime("%H:%M")
+
+
+import ephem
+from datetime import datetime
+
+
+def get_visible_planets(lat, lon):
+    observer = ephem.Observer()
+    observer.lat = str(lat)
+    observer.lon = str(lon)
+    observer.date = datetime.now(timezone.utc)
+
+    planets = {
+        "Меркурий": ephem.Mercury(observer),
+        "Венера": ephem.Venus(observer),
+        "Марс": ephem.Mars(observer),
+        "Юпитер": ephem.Jupiter(observer),
+        "Сатурн": ephem.Saturn(observer),
+        "Уран": ephem.Uranus(observer),
+        "Нептун": ephem.Neptune(observer),
+    }
+
+    visible = []
+    for name, planet in planets.items():
+        planet.compute(observer)
+        alt_deg = planet.alt * 180 / ephem.pi  # перевод в градусы
+        if alt_deg > 0:
+            visible.append(f"{name} (высота: {alt_deg:.1f}°)")
+
+    if visible:
+        msg = "🔭 Сейчас можно наблюдать следующие планеты:\n"
+        msg += "\n".join(f"• {p}" for p in visible)
+    else:
+        msg = "❌ Сейчас ни одна планета не видна над горизонтом."
+
+    return msg
+
+
+def send_apod(message):
+    response = requests.get(f"https://api.nasa.gov/planetary/apod?api_key={api_nasa}")
+    MAX_CAPTION_LENGTH = 1024
+    if response.status_code == 200:
+        data = response.json()
+        title = data.get("title", "Без названия")
+        explanation = data.get("explanation", "Нет описания.")
+        translate_explanation = translate_to_russian(explanation)
+        caption_text = f"🔭 {title}\n\n{translate_explanation}"
+        media_url = data.get("url", "")
+        media_type = data.get("media_type", "image")
+
+        if media_type == "image" and len(caption_text) <= MAX_CAPTION_LENGTH:
+            bot.send_photo(message.chat.id, media_url, caption=f"🔭 {caption_text}")
+        else:
+            bot.send_message(
+                message.chat.id,
+                f"{title}\n\n{translate_explanation}\n📺 Видео: {media_url}",
+            )
+    else:
+        bot.send_message(message.chat.id, "🚫 Не удалось получить изображение от NASA.")
+
+
+def translate_to_russian(text):
+    new_text = GoogleTranslator(source="auto", target="ru").translate(text)
+    return new_text
 
 
 # Получение погоды по названию города
@@ -269,4 +395,4 @@ def callback_convert(call):
 
 
 # Запуск бота в режиме ожидания сообщений
-bot.polling(none_stop=True)
+bot.polling(non_stop=True)

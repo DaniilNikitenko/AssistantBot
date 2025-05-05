@@ -6,7 +6,6 @@ from datetime import datetime, timezone  # для работы с датой и 
 
 import requests  # для HTTP-запросов (например, к API погоды и валют)
 from dotenv import load_dotenv  # для загрузки переменных окружения из .env-файла
-
 import os  # для работы с переменными окружения
 from timezonefinder import (
     TimezoneFinder,
@@ -15,7 +14,10 @@ import ephem  # для астрономических вычислений (фа
 import pytz  # для работы с часовыми поясами
 
 from deep_translator import GoogleTranslator
+from database import create_db, save_user_data, get_user_city, get_user_coordinates
 
+create_db()  # создаём БД при запуске
+user_temp_data = {}  # временное хранилище
 
 # Загрузка переменных окружения из .env
 load_dotenv()
@@ -27,42 +29,49 @@ api_convert = os.getenv("API_CONVERT")  # API-ключ для конвертац
 api_nasa = os.getenv("NASA_API")
 amount = 0  # Сумма для конвертации
 
-lat = 0  # Широта
-lon = 0  # Долгота
-city = None
-
 
 # Обработчик команды /start и /help — выводит главное меню
 
 
 @bot.message_handler(commands=["start"])
-def get_location(message):
+def handle_location(message):
     if message.location:
-        global lat, lon
-        lat, lon = message.location.latitude, message.location.longitude
+        user_id = message.from_user.id
+        latitude = message.location.latitude
+        longitude = message.location.longitude
+        user_temp_data[user_id] = {"latitude": latitude, "longitude": longitude}
         bot.send_message(
             message.chat.id,
             "📍 Геолокация была загружена успешна.\n Теперь введите название вашего города",
         )
         bot.register_next_step_handler(message, get_city)
-        print(lat, lon)
     else:
         bot.send_message(message.chat.id, "📍 Пожалуйста, отправьте свою геолокацию.")
-        bot.register_next_step_handler(message, get_location)
+        bot.register_next_step_handler(message, handle_location)
 
 
 def get_city(message):
-    global city
-    city = message.text.strip().lower()
-    bot.send_message(message.chat.id, "Город успешно сохранён")
-    help_menu(message)
+    user_id = message.from_user.id
+    city_name = message.text.strip()
+
+    if user_id in user_temp_data:
+        latitude = user_temp_data[user_id]["latitude"]
+        longitude = user_temp_data[user_id]["longitude"]
+
+        save_user_data(user_id, latitude, longitude, city_name)
+
+        bot.send_message(
+            message.chat.id,
+            f"✅ Данные сохранены:\nГород: {city_name}\nШирота: {latitude}\nДолгота: {longitude}\n Для того чтобы открыть меня введи\n /help",
+        )
+        user_temp_data.pop(user_id)
+    else:
+        bot.send_message(message.chat.id, "Ошибка: не найдена информация о геолокации.")
 
 
 @bot.message_handler(commands=["settings"])
 def setting_menu(message):
-    markup_settings = types.InlineKeyboardMarkup(
-        row_width=2
-    )  # создаем кнопки в 2 столбца
+    markup_settings = types.InlineKeyboardMarkup(row_width=2)
     btn_city_change = types.InlineKeyboardButton(
         "Изменить город", callback_data="change_city"
     )
@@ -80,24 +89,65 @@ def setting_menu(message):
 def handle_settings_change(call):
     if call.data == "change_city":
         bot.send_message(call.message.chat.id, "Введите новый город")
-        bot.register_next_step_handler(call.message, get_city)
+        bot.register_next_step_handler(call.message, change_city_handler)
     elif call.data == "change_geo":
-        bot.send_message(
-            call.message.chat.id, "Пожалуйста, отправьте новую геолокацию."
-        )
+        bot.send_message(call.message.chat.id, "📍 Отправьте новую геолокацию:")
         bot.register_next_step_handler(call.message, update_location_only)
 
 
 def update_location_only(message):
-    global lat, lon
     if message.location:
-        lat, lon = message.location.latitude, message.location.longitude
-        bot.send_message(message.chat.id, "📍 Геолокация обновлена.")
+        user_id = message.from_user.id
+        latitude = message.location.latitude
+        longitude = message.location.longitude
+
+        update_user_location(user_id, latitude, longitude)
+
+        bot.send_message(message.chat.id, "✅ Геолокация обновлена.")
     else:
         bot.send_message(
             message.chat.id, "❗ Пожалуйста, отправьте корректную геолокацию."
         )
         bot.register_next_step_handler(message, update_location_only)
+
+
+def change_city_handler(message):
+    user_id = message.from_user.id
+    city = message.text.strip()
+
+    # Сначала получаем текущие координаты из БД
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT latitude, longitude FROM users WHERE user_id = ?", (user_id,)
+    )
+    result = cursor.fetchone()
+    conn.close()
+
+    if result:
+        latitude, longitude = result
+        save_user_data(user_id, latitude, longitude, city)
+        bot.send_message(message.chat.id, f"✅ Город обновлён на: {city}")
+    else:
+        bot.send_message(
+            message.chat.id, "⚠️ Сначала отправьте геолокацию через /start."
+        )
+
+
+# 👇 Если нужно только обновить координаты, без изменения города
+def update_user_location(user_id, latitude, longitude):
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE users
+        SET latitude = ?, longitude = ?
+        WHERE user_id = ?
+    """,
+        (latitude, longitude, user_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 @bot.message_handler(commands=["help"])
@@ -124,7 +174,7 @@ def help_menu(message):
 def handle_main_menu(call):
     bot.answer_callback_query(call.id)
     if call.data == "weather":
-        get_weather(call.message)
+        get_weather(call)
     elif call.data == "convert":
         bot.send_message(call.message.chat.id, "💰 Введите сумму для конвертации:")
         bot.register_next_step_handler(call.message, summa)
@@ -160,9 +210,13 @@ def astro_menu(message):
     in ["phase_moon", "sunrise", "astra_picture", "astra_position_planet"]
 )
 def handle_astro_menu(call):
+    user_id = call.message.chat.id
+    lat, lon = get_user_coordinates(user_id)
     bot.answer_callback_query(call.id)
     if call.data == "phase_moon":
+        print(lat, lon)
         phase = get_moon_phase(lat, lon)
+        print(phase)
         bot.send_message(
             call.message.chat.id, f"Фаза Луны для вашего местоположения: {phase}"
         )
@@ -178,38 +232,37 @@ def handle_astro_menu(call):
 
 
 # Функции (не используются напрямую, возможно остались отладки)
-def get_phase_moon(message):
-    phase = get_moon_phase(lat, lon)
-    bot.send_message(message.chat.id, f"Фаза Луны для вашего местоположения:\n {phase}")
-
-
-def get_sunrise_time(message):
-    sunrise_time = sunrise_time(lat, lon)
-    bot.send_message(
-        message.chat.id, f"Восход: {sunrise_time[0]}, Закат: {sunrise_time[1]}"
-    )
 
 
 # Функция определения фазы луны по координатам
 def get_moon_phase(lat, lon):
-    global observer
     observer = ephem.Observer()
     observer.lat = str(lat)
     observer.lon = str(lon)
-    moon = ephem.Moon(observer)
-    phase = moon.phase  # значение от 0 до 100
+    observer.date = ephem.now()
 
-    # Преобразуем числовую фазу в текстовое описание
-    if phase < 1:
+    moon = ephem.Moon(observer)
+    phase = moon.phase
+
+    # Вычисляем возраст Луны в днях
+    prev_new_moon = ephem.previous_new_moon(observer.date)
+    age = observer.date - prev_new_moon  # Возраст Луны в днях
+
+    # Определяем фазу по возрасту
+    if age < 1.5:
         return "🌑 Новолуние"
-    elif 1 <= phase < 50:
-        return "🌒 Растущий полумесяц"
-    elif phase == 50:
-        return "🌕 Полнолуние"
-    elif 50 < phase < 99:
+    elif age < 6.5:
+        return "🌒 Растущий серп"
+    elif age < 13.5:
+        return "🌓 Первая четверть"
+    elif age < 15.5:
+        return "🌔 Почти полнолуние"
+    elif age < 21:
         return "🌖 Убывающая Луна"
-    elif phase >= 99:
-        return "🌘 Последний полумесяц"
+    elif age < 27:
+        return "🌘 Последняя четверть"
+    else:
+        return "🌑 Новолуние"
 
 
 # Расчёт времени восхода и заката солнца с учётом местного времени
@@ -304,7 +357,11 @@ def translate_to_russian(text):
 
 
 # Получение погоды по названию города
-def get_weather(message):
+def get_weather(call):
+    user_id = call.message.chat.id
+    print(user_id)
+    city = get_user_city(user_id)
+    print(city)
     res = requests.get(
         f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={api}&units=metric&lang=ru"
     )
@@ -341,14 +398,14 @@ def get_weather(message):
         time = datetime.now().strftime("%H:%M")
 
         bot.send_message(
-            message.chat.id,
+            call.message.chat.id,
             f"{emoji} Погода в {city.title()}:\n"
             f" {description}\n"
             f"🌡 Температура: {temp}°C (ощущается как {feels}°C)\n"
             f"🕒 Время: {time}",
         )
     else:
-        bot.send_message(message.chat.id, "⚠️ Город не найден. Попробуй ещё раз.")
+        bot.send_message(call.message.chat.id, "⚠️ Город не найден. Попробуй ещё раз.")
 
 
 # Получение суммы для конвертации и выбор валютной пары
@@ -392,6 +449,32 @@ def callback_convert(call):
         )
     else:
         bot.send_message(call.message.chat.id, "⚠️ Не удалось получить курс валют.")
+
+
+import sqlite3
+
+
+@bot.message_handler(commands=["show_users"])
+def show_users(message):
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT user_id, city, latitude, longitude FROM users")
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        bot.send_message(message.chat.id, "📭 В базе данных нет пользователей.")
+        return
+
+    text = "👤 Пользователи в базе данных:\n\n"
+    for row in rows:
+        uid, city, lat, lon = row
+        text += f"ID: {uid}\nГород: {city}\nШирота: {lat}\nДолгота: {lon}\n\n"
+
+    # Если слишком длинный текст, разбей его на части
+    for i in range(0, len(text), 4000):  # телега ограничивает ~4096 символов
+        bot.send_message(message.chat.id, text[i : i + 4000])
 
 
 # Запуск бота в режиме ожидания сообщений
